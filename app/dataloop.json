@@ -1,0 +1,62 @@
+{
+    "name": "dl-tunnel",
+    "displayName": "DL Tunnel",
+    "version": "0.1.0",
+    "scope": "project",
+    "description": "Self-hosted WebSocket relay for VS Code / Cursor Remote SSH to on-prem machines. Authenticated via Dataloop JWT — no Microsoft/GitHub relay required.",
+    "components": {
+        "panels": [
+            {
+                "name": "relay",
+                "supportedSlots": [],
+                "conditions": {}
+            }
+        ],
+        "modules": [
+            {
+                "name": "dl-tunnel-module",
+                "entryPoint": "runner.py",
+                "className": "Runner",
+                "initInputs": [],
+                "config": {
+                    "isCustomServer": true
+                },
+                "functions": [
+                    {
+                        "name": "dummy",
+                        "output": [],
+                        "input": []
+                    }
+                ]
+            }
+        ],
+        "services": [
+            {
+                "name": "dl-tunnel-service",
+                "displayName": "DL Tunnel Relay",
+                "moduleName": "dl-tunnel-module",
+                "panelNames": ["relay"],
+                "initParams": {},
+                "runtime": {
+                    "podType": "regular-xs",
+                    "numReplicas": 1,
+                    "concurrency": 10,
+                    "singleAgent": false,
+                    "runnerImage": "gcr.io/viewo-g/piper/agent/dl-tunnel:0.1.0",
+                    "autoscaler": {
+                        "type": "rabbitmq",
+                        "minReplicas": 1,
+                        "maxReplicas": 1,
+                        "queueLength": 1
+                    },
+                    "preemptible": false
+                },
+                "drainTime": 600,
+                "onReset": "failed",
+                "runExecutionAsProcess": false,
+                "executionTimeout": 86400,
+                "maxAttempts": 3
+            }
+        ]
+    }
+}

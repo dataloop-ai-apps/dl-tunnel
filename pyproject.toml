@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "dl-tunnel"
+version = "0.1.0"
+description = "Self-hosted WebSocket tunnel for Cursor / VS Code Remote-SSH via Dataloop FaaS"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = [
+    "websockets>=12.0",
+    "dtlpy",
+]
+
+[project.scripts]
+dl-tunnel = "dl_tunnel:main"
+
+[project.urls]
+Repository = "https://github.com/dataloop-ai/dl-tunnel"
+
+[tool.setuptools]
+package-dir = {"" = "client"}
+py-modules = ["dl_tunnel"]
