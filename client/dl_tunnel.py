@@ -1,13 +1,21 @@
 """dl-tunnel client.
 
-Two commands, no flags for credentials, nothing on disk:
+Two commands:
 
-    dl-tunnel start target --name <name> [--local 127.0.0.1:22]
-    dl-tunnel start local  --name <name> [--port 0]
+    dl-tunnel start target --name <name> [--password <pwd>] [--local 127.0.0.1:22]
+    dl-tunnel start local  --name <name> [--password <pwd>] [--port 0]
 
-Both prompt for a Dataloop JWT, resolve the relay URL from the installed
-``dl-tunnel`` DPK, and run the tunnel until the JWT exp claim is reached
-or the process exits.
+Both prompt for a Dataloop JWT (used only to resolve the relay URL via the
+installed ``dl-tunnel`` DPK and obtain the JWT-APP gateway cookie). The
+tunnel itself authenticates with a shared password, allowing multiple
+developers to connect to the same destination simultaneously.
+
+Three-channel design:
+  target  — opens a long-lived control WS (register). On each
+            {"type": "open_session"} message, spawns a data WS + TCP
+            connection to the local sshd.
+  local   — each accepted SSH connection opens a connect WS. The relay
+            pairs it with a target-side data WS and pipes them together.
 """
 
 from __future__ import annotations
@@ -36,16 +44,25 @@ log = logging.getLogger("dl-tunnel")
 
 
 # ---------------------------------------------------------------------------
-# Token input
+# Credential input
 # ---------------------------------------------------------------------------
 
 def prompt_token() -> str:
-    """Read the JWT once. getpass on a TTY, raw stdin when piped."""
+    """Read the Dataloop JWT once. getpass on a TTY, raw stdin when piped."""
     raw = getpass("Dataloop token: ") if sys.stdin.isatty() else sys.stdin.read()
     token = raw.strip()
     if not token:
         raise SystemExit("empty token")
     return token
+
+
+def prompt_password() -> str:
+    """Read the tunnel password. getpass on a TTY, raw stdin when piped."""
+    raw = getpass("Tunnel password: ") if sys.stdin.isatty() else sys.stdin.read()
+    password = raw.strip()
+    if not password:
+        raise SystemExit("empty password")
+    return password
 
 
 def jwt_exp(token: str) -> int:
@@ -126,12 +143,25 @@ def _probe_gate(gate_url: str, token: str) -> tuple[str, dict[str, str]]:
 # Wire protocol
 # ---------------------------------------------------------------------------
 
-async def _handshake(ws, action: str, name: str, token: str) -> None:
-    await ws.send(json.dumps({"action": action, "endpoint": name, "token": token}))
+async def _handshake(
+    ws,
+    action: str,
+    name: str,
+    password: str,
+    session_id: str | None = None,
+) -> None:
+    """Send a handshake message and wait for the relay's ok/error response.
+
+    Raises RuntimeError on relay error (safe to catch inside async tasks).
+    """
+    msg: dict = {"action": action, "endpoint": name, "password": password}
+    if session_id is not None:
+        msg["session_id"] = session_id
+    await ws.send(json.dumps(msg))
     raw = await asyncio.wait_for(ws.recv(), timeout=HANDSHAKE_TIMEOUT)
-    msg = json.loads(raw)
-    if msg.get("status") != "ok":
-        raise SystemExit(f"relay error: {msg.get('message', 'unknown')}")
+    resp = json.loads(raw)
+    if resp.get("status") != "ok":
+        raise RuntimeError(f"relay error: {resp.get('message', 'unknown')}")
 
 
 async def _bridge(ws, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -169,35 +199,53 @@ async def _bridge(ws, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
 
 
 # ---------------------------------------------------------------------------
-# target: register and forward to a local TCP service (sshd by default)
+# target: control channel + per-session data channels
 # ---------------------------------------------------------------------------
 
-async def cmd_target(name: str, local_host: str, local_port: int) -> None:
+async def cmd_target(name: str, local_host: str, local_port: int, password: str) -> None:
     token = prompt_token()
     exp = jwt_exp(token)
     wss_url, headers = resolve_relay(token)
-    log.info("target %r registered against %s; forwarding to %s:%d",
+    log.info("target %r registering against %s; forwarding to %s:%d",
              name, wss_url, local_host, local_port)
 
-    async def loop() -> None:
+    async def open_data_channel(session_id: str) -> None:
+        """Open one data WS + one TCP connection to sshd for a single developer session."""
+        try:
+            async with websockets.connect(wss_url, additional_headers=headers) as data_ws:
+                await _handshake(data_ws, "data", name, password, session_id=session_id)
+                reader, writer = await asyncio.open_connection(local_host, local_port)
+                await _bridge(data_ws, reader, writer)
+        except (websockets.exceptions.WebSocketException, OSError, RuntimeError) as e:
+            log.warning("data channel session=%s failed: %s", session_id, e)
+
+    async def control_loop() -> None:
         while True:
             try:
-                async with websockets.connect(wss_url, additional_headers=headers) as ws:
-                    await _handshake(ws, "register", name, token)
-                    reader, writer = await asyncio.open_connection(local_host, local_port)
-                    await _bridge(ws, reader, writer)
-            except (websockets.exceptions.WebSocketException, OSError) as e:
-                log.warning("relay error: %s; retrying in %ds", e, RECONNECT_DELAY)
+                async with websockets.connect(wss_url, additional_headers=headers) as ctrl_ws:
+                    await _handshake(ctrl_ws, "register", name, password)
+                    log.info("target %r registered; awaiting sessions", name)
+                    async for raw in ctrl_ws:
+                        try:
+                            msg = json.loads(raw if isinstance(raw, str) else raw.decode())
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            continue
+                        if msg.get("type") == "open_session":
+                            session_id = msg.get("session_id", "")
+                            if session_id:
+                                asyncio.ensure_future(open_data_channel(session_id))
+            except (websockets.exceptions.WebSocketException, OSError, RuntimeError) as e:
+                log.warning("control channel error: %s; retrying in %ds", e, RECONNECT_DELAY)
                 await asyncio.sleep(RECONNECT_DELAY)
 
-    await _run_until(loop(), exp)
+    await _run_until(control_loop(), exp)
 
 
 # ---------------------------------------------------------------------------
 # local: open a TCP listener; each accepted socket becomes a connect session
 # ---------------------------------------------------------------------------
 
-async def cmd_local(name: str, port: int) -> None:
+async def cmd_local(name: str, port: int, password: str) -> None:
     token = prompt_token()
     exp = jwt_exp(token)
     wss_url, headers = resolve_relay(token)
@@ -205,9 +253,9 @@ async def cmd_local(name: str, port: int) -> None:
     async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
             async with websockets.connect(wss_url, additional_headers=headers) as ws:
-                await _handshake(ws, "connect", name, token)
+                await _handshake(ws, "connect", name, password)
                 await _bridge(ws, reader, writer)
-        except (websockets.exceptions.WebSocketException, OSError) as e:
+        except (websockets.exceptions.WebSocketException, OSError, RuntimeError) as e:
             log.warning("session failed: %s", e)
             try:
                 writer.close()
@@ -257,11 +305,15 @@ def main() -> None:
 
     target = role.add_parser("target", help="register this machine as the SSH target")
     target.add_argument("--name", required=True)
+    target.add_argument("--password", default=None,
+                        help="shared tunnel password (prompted if omitted)")
     target.add_argument("--local", default="127.0.0.1:22",
                         help="local HOST:PORT to forward to (default 127.0.0.1:22)")
 
     local = role.add_parser("local", help="open a local SSH listener pointing at a target")
     local.add_argument("--name", required=True)
+    local.add_argument("--password", default=None,
+                       help="shared tunnel password (prompted if omitted)")
     local.add_argument("--port", type=int, default=0,
                        help="local TCP port (default 0 = pick a free port)")
 
@@ -274,9 +326,11 @@ def main() -> None:
 
     if args.role == "target":
         host, port = _parse_host_port(args.local)
-        asyncio.run(cmd_target(args.name, host, port))
+        password = args.password or prompt_password()
+        asyncio.run(cmd_target(args.name, host, port, password))
     else:
-        asyncio.run(cmd_local(args.name, args.port))
+        password = args.password or prompt_password()
+        asyncio.run(cmd_local(args.name, args.port, password))
 
 
 if __name__ == "__main__":

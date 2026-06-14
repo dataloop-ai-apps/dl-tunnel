@@ -2,14 +2,14 @@
 Integration tests for the dl-tunnel relay server.
 
 Spins up a real WebSocket server in-process on a random port for each test.
-Tests cover the full register → connect → pipe flow plus auth/error cases.
+Tests cover the full three-channel flow (register → connect → data → pipe)
+plus all auth/error cases.
 """
 
 import asyncio
 import json
 import os
 import sys
-import time
 
 import pytest
 import websockets
@@ -17,67 +17,11 @@ import websockets
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "app"))
 
 from relay import Relay  # noqa: E402
-from auth import AuthError  # noqa: E402,F401
-
-
-# ------------------------------------------------------------------
-# Helpers: build minimal JWTs without a real DL backend
-# ------------------------------------------------------------------
-
-import base64
-
-
-def _make_fake_jwt(
-    email: str = "dev@example.com",
-    sub: str = "google-oauth2|dev",
-    expired: bool = False,
-) -> str:
-    """
-    Build a minimal unsigned JWT for testing.
-
-    The relay uses verify_signature=False so we just need a valid structure
-    with the right claims (email, sub, exp).
-    """
-    import json as _json
-
-    header = base64.urlsafe_b64encode(b'{"alg":"HS256","typ":"JWT"}').rstrip(b"=").decode()
-
-    exp = int(time.time()) + (-10 if expired else 3600)
-    payload_data = {"email": email, "sub": sub, "exp": exp}
-    payload = (
-        base64.urlsafe_b64encode(_json.dumps(payload_data).encode())
-        .rstrip(b"=")
-        .decode()
-    )
-    return f"{header}.{payload}.fakesig"
-
-
-VALID_TOKEN = _make_fake_jwt()
-EXPIRED_TOKEN = _make_fake_jwt(expired=True)
-
-
-def _make_no_identity_jwt() -> str:
-    """JWT with no email and no sub -- should be rejected."""
-    header = base64.urlsafe_b64encode(b'{"alg":"HS256","typ":"JWT"}').rstrip(b"=").decode()
-    exp = int(time.time()) + 3600
-    import json as _json
-    payload_data = {"exp": exp}
-    payload = (
-        base64.urlsafe_b64encode(_json.dumps(payload_data).encode())
-        .rstrip(b"=")
-        .decode()
-    )
-    return f"{header}.{payload}.fakesig"
 
 
 # ------------------------------------------------------------------
 # Fixtures
 # ------------------------------------------------------------------
-
-@pytest.fixture
-def relay_url(unused_tcp_port):
-    return f"ws://localhost:{unused_tcp_port}"
-
 
 @pytest.fixture
 async def relay_server(unused_tcp_port):
@@ -90,138 +34,269 @@ async def relay_server(unused_tcp_port):
 
 
 # ------------------------------------------------------------------
-# Helpers
+# Low-level helpers
 # ------------------------------------------------------------------
 
-async def _handshake(ws, action: str, endpoint: str, token: str) -> dict:
-    await ws.send(json.dumps({"action": action, "endpoint": endpoint, "token": token}))
-    raw = await asyncio.wait_for(ws.recv(), timeout=3)
+async def _send_recv(ws, payload: dict, timeout: float = 3.0) -> dict:
+    await ws.send(json.dumps(payload))
+    raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
     return json.loads(raw)
 
 
+async def _open_data_channel(
+    url: str,
+    endpoint: str,
+    session_id: str,
+    password: str,
+    echo: bool = False,
+) -> None:
+    """Open a data channel for the given session. Optionally echo frames back."""
+    async with websockets.connect(url) as data_ws:
+        resp = await _send_recv(data_ws, {
+            "action": "data", "endpoint": endpoint,
+            "session_id": session_id, "password": password,
+        })
+        if resp["status"] != "ok":
+            return
+        if echo:
+            async for msg in data_ws:
+                await data_ws.send(msg)
+
+
+async def _run_target(
+    url: str,
+    endpoint: str,
+    password: str,
+    ready: asyncio.Event,
+    n_sessions: int = 1,
+    echo: bool = False,
+) -> None:
+    """Simulate a target: register, then handle up to n_sessions open_session messages."""
+    data_tasks: list[asyncio.Task] = []
+    async with websockets.connect(url) as ctrl_ws:
+        resp = await _send_recv(ctrl_ws, {
+            "action": "register", "endpoint": endpoint, "password": password,
+        })
+        assert resp["status"] == "ok", f"register failed: {resp}"
+        ready.set()
+
+        handled = 0
+        async for raw in ctrl_ws:
+            msg = json.loads(raw)
+            if msg.get("type") == "open_session":
+                t = asyncio.create_task(
+                    _open_data_channel(url, endpoint, msg["session_id"], password, echo=echo)
+                )
+                data_tasks.append(t)
+                handled += 1
+                if handled >= n_sessions:
+                    break
+
+        if data_tasks:
+            await asyncio.gather(*data_tasks, return_exceptions=True)
+
+
 # ------------------------------------------------------------------
-# Tests
+# Tests — registration
 # ------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_register_and_connect_appear_in_registry(relay_server):
-    """On-prem registers, developer connects — both handshakes succeed."""
-    url = relay_server
-
-    async with websockets.connect(url) as reg_ws:
-        resp = await _handshake(reg_ws, "register", "my-machine", VALID_TOKEN)
+async def test_register_ok(relay_server):
+    """Target registers with a password → relay acknowledges."""
+    async with websockets.connect(relay_server) as ws:
+        resp = await _send_recv(ws, {"action": "register", "endpoint": "box", "password": "pw"})
         assert resp["status"] == "ok"
-
-        async with websockets.connect(url) as conn_ws:
-            resp2 = await _handshake(conn_ws, "connect", "my-machine", VALID_TOKEN)
-            assert resp2["status"] == "ok"
-
-
-@pytest.mark.asyncio
-async def test_bidirectional_pipe(relay_server):
-    """Data flows both ways through the relay."""
-    url = relay_server
-
-    async with websockets.connect(url) as reg_ws:
-        await _handshake(reg_ws, "register", "pipe-test", VALID_TOKEN)
-
-        async with websockets.connect(url) as conn_ws:
-            await _handshake(conn_ws, "connect", "pipe-test", VALID_TOKEN)
-
-            # Developer → on-prem
-            await conn_ws.send(b"hello from developer")
-            received = await asyncio.wait_for(reg_ws.recv(), timeout=2)
-            assert received == b"hello from developer"
-
-            # On-prem → developer
-            await reg_ws.send(b"hello from onprem")
-            received2 = await asyncio.wait_for(conn_ws.recv(), timeout=2)
-            assert received2 == b"hello from onprem"
-
-
-@pytest.mark.asyncio
-async def test_connect_to_unregistered_endpoint_returns_error(relay_server):
-    """Connecting to a non-existent endpoint returns a clear error."""
-    url = relay_server
-
-    async with websockets.connect(url) as ws:
-        resp = await _handshake(ws, "connect", "does-not-exist", VALID_TOKEN)
-        assert resp["status"] == "error"
-        assert "not found" in resp["message"]
-
-
-@pytest.mark.asyncio
-async def test_expired_token_rejected(relay_server):
-    """Expired JWT is rejected at handshake."""
-    url = relay_server
-
-    async with websockets.connect(url) as ws:
-        resp = await _handshake(ws, "register", "any-machine", EXPIRED_TOKEN)
-        assert resp["status"] == "error"
-        assert "expired" in resp["message"]
-
-
-@pytest.mark.asyncio
-async def test_missing_token_rejected(relay_server):
-    """Missing token is rejected."""
-    url = relay_server
-
-    async with websockets.connect(url) as ws:
-        resp = await _handshake(ws, "register", "any-machine", "")
-        assert resp["status"] == "error"
-
-
-@pytest.mark.asyncio
-async def test_missing_identity_rejected(relay_server):
-    """JWT with no email and no sub is rejected."""
-    url = relay_server
-    token = _make_no_identity_jwt()
-
-    async with websockets.connect(url) as ws:
-        resp = await _handshake(ws, "register", "any-machine", token)
-        assert resp["status"] == "error"
-        assert "email/sub" in resp["message"]
+        assert "box" in resp["message"]
 
 
 @pytest.mark.asyncio
 async def test_duplicate_registration_rejected(relay_server):
-    """Second registration of the same endpoint is rejected while first is alive."""
-    url = relay_server
-
-    async with websockets.connect(url) as first_ws:
-        resp1 = await _handshake(first_ws, "register", "dup-test", VALID_TOKEN)
+    """Second register of the same endpoint name is rejected while the first is alive."""
+    async with websockets.connect(relay_server) as first_ws:
+        resp1 = await _send_recv(first_ws, {"action": "register", "endpoint": "dup", "password": "pw"})
         assert resp1["status"] == "ok"
 
-        async with websockets.connect(url) as second_ws:
-            resp2 = await _handshake(second_ws, "register", "dup-test", VALID_TOKEN)
+        async with websockets.connect(relay_server) as second_ws:
+            resp2 = await _send_recv(second_ws, {"action": "register", "endpoint": "dup", "password": "pw"})
             assert resp2["status"] == "error"
             assert "already registered" in resp2["message"]
 
 
+# ------------------------------------------------------------------
+# Tests — connect auth
+# ------------------------------------------------------------------
+
 @pytest.mark.asyncio
-async def test_user_isolation(relay_server):
-    """Endpoint registered by user A is not visible to user B."""
-    url = relay_server
-    token_a = _make_fake_jwt(sub="user-a")
-    token_b = _make_fake_jwt(sub="user-b")
+async def test_connect_wrong_password(relay_server):
+    """Connect with wrong password is rejected with a generic auth error."""
+    ready = asyncio.Event()
+    target = asyncio.create_task(_run_target(relay_server, "box", "correct", ready))
+    await asyncio.wait_for(ready.wait(), timeout=3)
 
-    async with websockets.connect(url) as reg_ws:
-        await _handshake(reg_ws, "register", "shared-name", token_a)
+    async with websockets.connect(relay_server) as ws:
+        resp = await _send_recv(ws, {"action": "connect", "endpoint": "box", "password": "wrong"})
+        assert resp["status"] == "error"
+        assert "authentication failed" in resp["message"]
 
-        # user-b tries to connect -- resolves to user-b:shared-name, not user-a:shared-name
-        async with websockets.connect(url) as conn_ws:
-            resp = await _handshake(conn_ws, "connect", "shared-name", token_b)
-            assert resp["status"] == "error"
-            assert "not found" in resp["message"]
+    target.cancel()
+    await asyncio.gather(target, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_connect_unregistered_endpoint(relay_server):
+    """Connecting to an endpoint that was never registered returns auth error."""
+    async with websockets.connect(relay_server) as ws:
+        resp = await _send_recv(ws, {"action": "connect", "endpoint": "ghost", "password": "pw"})
+        assert resp["status"] == "error"
+        assert "authentication failed" in resp["message"]
+
+
+# ------------------------------------------------------------------
+# Tests — missing fields
+# ------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_missing_password_rejected(relay_server):
+    """Handshake with no password field is rejected."""
+    async with websockets.connect(relay_server) as ws:
+        resp = await _send_recv(ws, {"action": "register", "endpoint": "box"})
+        assert resp["status"] == "error"
+        assert "password" in resp["message"]
+
+
+@pytest.mark.asyncio
+async def test_missing_endpoint_rejected(relay_server):
+    """Handshake with no endpoint field is rejected."""
+    async with websockets.connect(relay_server) as ws:
+        resp = await _send_recv(ws, {"action": "register", "password": "pw"})
+        assert resp["status"] == "error"
+        assert "endpoint" in resp["message"]
 
 
 @pytest.mark.asyncio
 async def test_unknown_action_rejected(relay_server):
     """Unknown action field returns error."""
-    url = relay_server
-
-    async with websockets.connect(url) as ws:
-        await ws.send(json.dumps({"action": "destroy", "endpoint": "x", "token": VALID_TOKEN}))
-        raw = await asyncio.wait_for(ws.recv(), timeout=3)
-        resp = json.loads(raw)
+    async with websockets.connect(relay_server) as ws:
+        resp = await _send_recv(ws, {"action": "destroy", "endpoint": "x", "password": "pw"})
         assert resp["status"] == "error"
+
+
+# ------------------------------------------------------------------
+# Tests — full session (three-channel flow)
+# ------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_full_session_data_flows(relay_server):
+    """Developer connects, target opens data channel, bytes flow both ways."""
+    ready = asyncio.Event()
+    target = asyncio.create_task(
+        _run_target(relay_server, "box", "pw", ready, n_sessions=1, echo=True)
+    )
+    await asyncio.wait_for(ready.wait(), timeout=3)
+
+    async with websockets.connect(relay_server) as conn_ws:
+        resp = await _send_recv(
+            conn_ws,
+            {"action": "connect", "endpoint": "box", "password": "pw"},
+            timeout=5,
+        )
+        assert resp["status"] == "ok"
+
+        await conn_ws.send(b"ping")
+        echoed = await asyncio.wait_for(conn_ws.recv(), timeout=5)
+        assert echoed == b"ping"
+
+    await asyncio.wait_for(target, timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_multi_user_independent_sessions(relay_server):
+    """Two developers connect simultaneously; sessions are fully independent."""
+    ready = asyncio.Event()
+    target = asyncio.create_task(
+        _run_target(relay_server, "box", "pw", ready, n_sessions=2, echo=True)
+    )
+    await asyncio.wait_for(ready.wait(), timeout=3)
+
+    async def developer(data: bytes) -> bytes:
+        async with websockets.connect(relay_server) as conn_ws:
+            resp = await _send_recv(
+                conn_ws,
+                {"action": "connect", "endpoint": "box", "password": "pw"},
+                timeout=5,
+            )
+            assert resp["status"] == "ok"
+            await conn_ws.send(data)
+            return await asyncio.wait_for(conn_ws.recv(), timeout=5)
+
+    result_a, result_b = await asyncio.gather(
+        developer(b"from-A"),
+        developer(b"from-B"),
+    )
+    assert result_a == b"from-A"
+    assert result_b == b"from-B"
+
+    await asyncio.wait_for(target, timeout=5)
+
+
+# ------------------------------------------------------------------
+# Tests — target disconnect
+# ------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_target_disconnect_cancels_pending_connect(relay_server):
+    """If the target disconnects while a developer is waiting, the developer gets an error."""
+    ready = asyncio.Event()
+
+    async def target_that_disconnects():
+        async with websockets.connect(relay_server) as ctrl_ws:
+            resp = await _send_recv(ctrl_ws, {
+                "action": "register", "endpoint": "flaky", "password": "pw",
+            })
+            assert resp["status"] == "ok"
+            ready.set()
+            # Disconnect immediately without opening a data channel.
+
+    target = asyncio.create_task(target_that_disconnects())
+    await asyncio.wait_for(ready.wait(), timeout=3)
+    await asyncio.wait_for(target, timeout=3)
+
+    # Now the target is gone. Developer should get an error quickly.
+    async with websockets.connect(relay_server) as ws:
+        resp = await _send_recv(ws, {
+            "action": "connect", "endpoint": "flaky", "password": "pw",
+        }, timeout=5)
+        assert resp["status"] == "error"
+
+
+# ------------------------------------------------------------------
+# Tests — data channel errors
+# ------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_data_channel_unknown_session(relay_server):
+    """Data channel with a fabricated session_id is rejected."""
+    ready = asyncio.Event()
+    target = asyncio.create_task(_run_target(relay_server, "box", "pw", ready))
+    await asyncio.wait_for(ready.wait(), timeout=3)
+
+    async with websockets.connect(relay_server) as ws:
+        resp = await _send_recv(ws, {
+            "action": "data", "endpoint": "box",
+            "session_id": "nonexistent-uuid", "password": "pw",
+        })
+        assert resp["status"] == "error"
+
+    target.cancel()
+    await asyncio.gather(target, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_data_channel_missing_session_id(relay_server):
+    """Data action with no session_id field is rejected."""
+    async with websockets.connect(relay_server) as ws:
+        resp = await _send_recv(ws, {
+            "action": "data", "endpoint": "box", "password": "pw",
+        })
+        assert resp["status"] == "error"
+        assert "session_id" in resp["message"]

@@ -1,12 +1,13 @@
 """
 Smoke test against the deployed dl-tunnel service on Dataloop.
 
-Flow (matches ollama-server test_app.py):
-  1. GET the gate URL with Bearer token → 302 redirect to apps URL
-  2. All subsequent requests go directly to the apps URL (no Bearer needed)
-     — just send the JWT-APP cookie.
+Flow:
+  1. GET the gate URL with Bearer token → 302 redirect to apps URL + JWT-APP cookie.
+  2. All subsequent WebSocket connections use the JWT-APP cookie for gateway auth.
+  3. Tunnel auth uses a shared password (not the JWT).
+  4. The test simulates both sides (target + developer) in-process.
 
-Login first:  python -c "import dtlpy as dl; dl.setenv('rc'); dl.login()"
+Login first:  python -c "import dtlpy as dl; dl.setenv('prod'); dl.login()"
 Run:          python tests/test_deployed.py
 """
 
@@ -25,6 +26,8 @@ GATE_BASE = (
     "https://gate.dataloop.ai/api/v1/apps/"
     "dl-tunnel-service-69eb31af4d5549438f428bbb/panels/relay/"
 )
+
+TEST_PASSWORD = "deployed-smoke-test-pw"
 
 
 # ------------------------------------------------------------------
@@ -53,62 +56,101 @@ def resolve_apps_url() -> tuple[str, str]:
 
 
 # ------------------------------------------------------------------
-# 2) Build the WSS URL + cookie header
+# 2) Build the WSS URL
 # ------------------------------------------------------------------
 
 def to_wss(apps_url: str) -> str:
     if apps_url.startswith("https://"):
-        return "wss://" + apps_url[len("https://") :]
+        return "wss://" + apps_url[len("https://"):]
     if apps_url.startswith("http://"):
-        return "ws://" + apps_url[len("http://") :]
+        return "ws://" + apps_url[len("http://"):]
     return apps_url
 
 
 # ------------------------------------------------------------------
-# 3) Test: register + connect roundtrip through the deployed relay
+# 3) Test helpers
 # ------------------------------------------------------------------
 
-async def _handshake(ws, action: str, endpoint: str, token: str) -> dict:
-    await ws.send(json.dumps({"action": action, "endpoint": endpoint, "token": token}))
-    raw = await asyncio.wait_for(ws.recv(), timeout=10)
+async def _send_recv(ws, payload: dict, timeout: float = 10.0) -> dict:
+    await ws.send(json.dumps(payload))
+    raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
     return json.loads(raw)
 
 
-async def run_roundtrip(wss_url: str, jwt_app: str, dl_token: str) -> None:
-    """
-    Open a register socket, then a connect socket, then pipe bytes both ways.
+async def _open_data_channel(
+    wss_url: str,
+    headers: dict,
+    endpoint: str,
+    session_id: str,
+    password: str,
+    echo: bool = False,
+) -> None:
+    async with websockets.connect(wss_url, additional_headers=headers) as data_ws:
+        resp = await _send_recv(data_ws, {
+            "action": "data", "endpoint": endpoint,
+            "session_id": session_id, "password": password,
+        })
+        print(f"  data channel response: {resp}")
+        assert resp.get("status") == "ok", f"data channel failed: {resp}"
+        if echo:
+            async for msg in data_ws:
+                await data_ws.send(msg)
 
-    Uses the ops `additional_headers` to send the JWT-APP cookie (like the
-    ollama example SDK does via `default_headers`). The DL JWT payload is
-    sent in the WebSocket handshake JSON.
+
+# ------------------------------------------------------------------
+# 4) Full three-channel roundtrip
+# ------------------------------------------------------------------
+
+async def run_roundtrip(wss_url: str, jwt_app: str) -> None:
+    """
+    Simulate target + developer in-process to verify the deployed relay.
+
+    Target side: register (control WS) → respond to open_session (data WS, echo mode).
+    Developer side: connect WS → send probe → verify echo.
     """
     headers = {"Cookie": f"JWT-APP={jwt_app}"}
     endpoint_name = f"pytest-{int(time.time())}"
+    target_ready = asyncio.Event()
 
-    print(f"--- opening register socket -> {wss_url} ---")
-    async with websockets.connect(wss_url, additional_headers=headers) as reg_ws:
-        resp = await _handshake(reg_ws, "register", endpoint_name, dl_token)
-        print(f"  register response: {resp}")
-        assert resp.get("status") == "ok", f"register failed: {resp}"
+    async def target_side() -> None:
+        async with websockets.connect(wss_url, additional_headers=headers) as ctrl_ws:
+            resp = await _send_recv(ctrl_ws, {
+                "action": "register", "endpoint": endpoint_name, "password": TEST_PASSWORD,
+            })
+            print(f"  register response: {resp}")
+            assert resp.get("status") == "ok", f"register failed: {resp}"
+            target_ready.set()
 
-        print(f"--- opening connect socket -> {wss_url} ---")
-        async with websockets.connect(wss_url, additional_headers=headers) as conn_ws:
-            resp2 = await _handshake(conn_ws, "connect", endpoint_name, dl_token)
-            print(f"  connect response:  {resp2}")
-            assert resp2.get("status") == "ok", f"connect failed: {resp2}"
+            async for raw in ctrl_ws:
+                msg = json.loads(raw)
+                if msg.get("type") == "open_session":
+                    asyncio.ensure_future(
+                        _open_data_channel(
+                            wss_url, headers, endpoint_name,
+                            msg["session_id"], TEST_PASSWORD, echo=True,
+                        )
+                    )
+                    break  # one session is enough for the smoke test
 
-            probe_dev = b"hello from developer side"
-            await conn_ws.send(probe_dev)
-            received = await asyncio.wait_for(reg_ws.recv(), timeout=5)
-            assert received == probe_dev, f"dev->onprem mismatch: {received!r}"
-            print(f"  dev -> onprem:  OK ({len(received)} bytes)")
+    print(f"--- starting target (endpoint={endpoint_name!r}) ---")
+    target_task = asyncio.create_task(target_side())
+    await asyncio.wait_for(target_ready.wait(), timeout=10)
 
-            probe_onprem = b"hello from onprem side"
-            await reg_ws.send(probe_onprem)
-            received2 = await asyncio.wait_for(conn_ws.recv(), timeout=5)
-            assert received2 == probe_onprem, f"onprem->dev mismatch: {received2!r}"
-            print(f"  onprem -> dev:  OK ({len(received2)} bytes)")
+    print(f"--- opening connect socket -> {wss_url} ---")
+    async with websockets.connect(wss_url, additional_headers=headers) as conn_ws:
+        resp2 = await _send_recv(conn_ws, {
+            "action": "connect", "endpoint": endpoint_name, "password": TEST_PASSWORD,
+        }, timeout=15)
+        print(f"  connect response:  {resp2}")
+        assert resp2.get("status") == "ok", f"connect failed: {resp2}"
 
+        probe = b"hello from developer side"
+        await conn_ws.send(probe)
+        received = await asyncio.wait_for(conn_ws.recv(), timeout=10)
+        assert received == probe, f"echo mismatch: {received!r}"
+        print(f"  echo OK ({len(received)} bytes)")
+
+    await asyncio.wait_for(target_task, timeout=5)
     print("\nAll tests passed - deployed relay is working end-to-end.")
 
 
@@ -119,10 +161,9 @@ async def run_roundtrip(wss_url: str, jwt_app: str, dl_token: str) -> None:
 def main() -> None:
     apps_url, jwt_app = resolve_apps_url()
     wss_url = to_wss(apps_url)
-    dl_token = dl.client_api.token
 
     try:
-        asyncio.run(run_roundtrip(wss_url, jwt_app, dl_token))
+        asyncio.run(run_roundtrip(wss_url, jwt_app))
     except AssertionError as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
         sys.exit(1)

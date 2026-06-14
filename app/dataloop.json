@@ -1,7 +1,7 @@
 {
     "name": "dl-tunnel",
     "displayName": "DL Tunnel",
-    "version": "0.1.0",
+    "version": "0.1.1",
     "scope": "project",
     "description": "Self-hosted WebSocket relay for VS Code / Cursor Remote SSH to on-prem machines. Authenticated via Dataloop JWT — no Microsoft/GitHub relay required.",
     "components": {

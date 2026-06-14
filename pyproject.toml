@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dl-tunnel"
-version = "0.1.0"
+version = "0.1.1"
 description = "Self-hosted WebSocket tunnel for Cursor / VS Code Remote-SSH via Dataloop FaaS"
 readme = "README.md"
 license = {text = "MIT"}
