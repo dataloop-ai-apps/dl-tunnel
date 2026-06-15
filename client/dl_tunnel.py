@@ -25,6 +25,7 @@ import asyncio
 import base64
 import json
 import logging
+import subprocess
 import sys
 import time
 import urllib.error
@@ -48,7 +49,15 @@ log = logging.getLogger("dl-tunnel")
 # ---------------------------------------------------------------------------
 
 def prompt_token() -> str:
-    """Read the Dataloop JWT once. getpass on a TTY, raw stdin when piped."""
+    """Return a Dataloop JWT. Tries the stored dtlpy login first, then prompts."""
+    try:
+        import dtlpy as dl
+        dl.setenv("prod")
+        if not dl.token_expired():
+            log.info("using stored Dataloop credentials")
+            return dl.token()
+    except Exception:
+        pass
     raw = getpass("Dataloop token: ") if sys.stdin.isatty() else sys.stdin.read()
     token = raw.strip()
     if not token:
@@ -272,6 +281,65 @@ async def cmd_local(name: str, port: int, password: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# connect: tunnel + SSH subprocess with auto-reconnect
+# ---------------------------------------------------------------------------
+
+SSH_RECONNECT_DELAY = 3
+
+
+async def cmd_connect(
+    name: str,
+    port: int,
+    password: str,
+    ssh_target: str,
+    forwards: list[str],
+) -> None:
+    token = prompt_token()
+    exp = jwt_exp(token)
+    wss_url, headers = resolve_relay(token)
+
+    async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            async with websockets.connect(wss_url, additional_headers=headers) as ws:
+                await _handshake(ws, "connect", name, password)
+                await _bridge(ws, reader, writer)
+        except (websockets.exceptions.WebSocketException, OSError, RuntimeError) as e:
+            log.warning("session failed: %s", e)
+            try:
+                writer.close()
+            except Exception:
+                pass
+
+    server = await asyncio.start_server(handle_client, "127.0.0.1", port)
+    host, bound_port = server.sockets[0].getsockname()[:2]
+    log.info("tunnel listening on %s:%d -> target %r", host, bound_port, name)
+
+    ssh_cmd = ["ssh", "-p", str(bound_port),
+               "-o", "ServerAliveInterval=15",
+               "-o", "ServerAliveCountMax=3",
+               "-o", "StrictHostKeyChecking=no",
+               "-N"]
+    for fwd in forwards:
+        ssh_cmd += ["-L", fwd]
+    ssh_cmd.append(f"{ssh_target}@127.0.0.1")
+
+    async def ssh_loop() -> None:
+        while True:
+            log.info("starting SSH: %s", " ".join(ssh_cmd))
+            proc = await asyncio.create_subprocess_exec(*ssh_cmd)
+            await proc.wait()
+            log.warning("SSH exited (code %s); retrying in %ds", proc.returncode, SSH_RECONNECT_DELAY)
+            await asyncio.sleep(SSH_RECONNECT_DELAY)
+
+    async with server:
+        ssh_task = asyncio.create_task(ssh_loop())
+        try:
+            await _run_until(server.serve_forever(), exp)
+        finally:
+            ssh_task.cancel()
+
+
+# ---------------------------------------------------------------------------
 # Lifetime
 # ---------------------------------------------------------------------------
 
@@ -317,6 +385,18 @@ def main() -> None:
     local.add_argument("--port", type=int, default=0,
                        help="local TCP port (default 0 = pick a free port)")
 
+    connect = sub.add_parser("connect",
+                              help="tunnel + SSH in one command (developer side)")
+    connect.add_argument("--name", required=True)
+    connect.add_argument("--password", default=None,
+                         help="shared tunnel password (prompted if omitted)")
+    connect.add_argument("--port", type=int, default=2222,
+                         help="local TCP port for tunnel (default 2222)")
+    connect.add_argument("--ssh-target", required=True, dest="ssh_target",
+                         help="SSH user on the remote machine (e.g. radmin)")
+    connect.add_argument("--forward", action="append", required=True,
+                         help="SSH -L forward spec, e.g. 443:host:443 (repeatable)")
+
     args = parser.parse_args()
     logging.basicConfig(
         level=logging.INFO,
@@ -324,7 +404,11 @@ def main() -> None:
         stream=sys.stderr,
     )
 
-    if args.role == "target":
+    if args.cmd == "connect":
+        password = args.password or prompt_password()
+        asyncio.run(cmd_connect(args.name, args.port, password,
+                                args.ssh_target, args.forward))
+    elif args.role == "target":
         host, port = _parse_host_port(args.local)
         password = args.password or prompt_password()
         asyncio.run(cmd_target(args.name, host, port, password))
