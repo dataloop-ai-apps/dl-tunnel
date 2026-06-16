@@ -48,8 +48,10 @@ log = logging.getLogger("dl-tunnel")
 # Credential input
 # ---------------------------------------------------------------------------
 
-def prompt_token() -> str:
-    """Return a Dataloop JWT. Tries the stored dtlpy login first, then prompts."""
+def prompt_token(token: str | None = None) -> str:
+    """Return a Dataloop JWT. Uses explicit token, stored dtlpy login, or prompts."""
+    if token:
+        return token
     try:
         import dtlpy as dl
         dl.setenv("prod")
@@ -211,8 +213,8 @@ async def _bridge(ws, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
 # target: control channel + per-session data channels
 # ---------------------------------------------------------------------------
 
-async def cmd_target(name: str, local_host: str, local_port: int, password: str) -> None:
-    token = prompt_token()
+async def cmd_target(name: str, local_host: str, local_port: int, password: str, token: str | None = None) -> None:
+    token = prompt_token(token)
     exp = jwt_exp(token)
     wss_url, headers = resolve_relay(token)
     log.info("target %r registering against %s; forwarding to %s:%d",
@@ -254,8 +256,8 @@ async def cmd_target(name: str, local_host: str, local_port: int, password: str)
 # local: open a TCP listener; each accepted socket becomes a connect session
 # ---------------------------------------------------------------------------
 
-async def cmd_local(name: str, port: int, password: str) -> None:
-    token = prompt_token()
+async def cmd_local(name: str, port: int, password: str, token: str | None = None) -> None:
+    token = prompt_token(token)
     exp = jwt_exp(token)
     wss_url, headers = resolve_relay(token)
 
@@ -293,8 +295,9 @@ async def cmd_connect(
     password: str,
     ssh_target: str,
     forwards: list[str],
+    token: str | None = None,
 ) -> None:
-    token = prompt_token()
+    token = prompt_token(token)
     exp = jwt_exp(token)
     wss_url, headers = resolve_relay(token)
 
@@ -377,6 +380,8 @@ def main() -> None:
                         help="shared tunnel password (prompted if omitted)")
     target.add_argument("--local", default="127.0.0.1:22",
                         help="local HOST:PORT to forward to (default 127.0.0.1:22)")
+    target.add_argument("--token", default=None,
+                        help="Dataloop JWT (uses stored login or prompts if omitted)")
 
     local = role.add_parser("local", help="open a local SSH listener pointing at a target")
     local.add_argument("--name", required=True)
@@ -384,6 +389,8 @@ def main() -> None:
                        help="shared tunnel password (prompted if omitted)")
     local.add_argument("--port", type=int, default=0,
                        help="local TCP port (default 0 = pick a free port)")
+    local.add_argument("--token", default=None,
+                       help="Dataloop JWT (uses stored login or prompts if omitted)")
 
     connect = sub.add_parser("connect",
                               help="tunnel + SSH in one command (developer side)")
@@ -396,6 +403,8 @@ def main() -> None:
                          help="SSH user on the remote machine (e.g. radmin)")
     connect.add_argument("--forward", action="append", required=True,
                          help="SSH -L forward spec, e.g. 443:host:443 (repeatable)")
+    connect.add_argument("--token", default=None,
+                         help="Dataloop JWT (uses stored login or prompts if omitted)")
 
     args = parser.parse_args()
     logging.basicConfig(
@@ -407,14 +416,17 @@ def main() -> None:
     if args.cmd == "connect":
         password = args.password or prompt_password()
         asyncio.run(cmd_connect(args.name, args.port, password,
-                                args.ssh_target, args.forward))
+                                args.ssh_target, args.forward,
+                                token=args.token))
     elif args.role == "target":
         host, port = _parse_host_port(args.local)
         password = args.password or prompt_password()
-        asyncio.run(cmd_target(args.name, host, port, password))
+        asyncio.run(cmd_target(args.name, host, port, password,
+                               token=args.token))
     else:
         password = args.password or prompt_password()
-        asyncio.run(cmd_local(args.name, args.port, password))
+        asyncio.run(cmd_local(args.name, args.port, password,
+                              token=args.token))
 
 
 if __name__ == "__main__":
