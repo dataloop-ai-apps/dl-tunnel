@@ -51,7 +51,6 @@ def publish_and_install(project: dl.Project, manifest):
     print('Done!')
 
 if __name__ == "__main__":
-
     dl.setenv('prod')
     if dl.token_expired():
         dl.login(callback_port=7364)

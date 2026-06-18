@@ -1,3 +1,4 @@
+
 """dl-tunnel client.
 
 Two commands:
@@ -296,6 +297,7 @@ async def cmd_connect(
     ssh_target: str,
     forwards: list[str],
     token: str | None = None,
+    ssh_key: str | None = None,
 ) -> None:
     token = prompt_token(token)
     exp = jwt_exp(token)
@@ -322,6 +324,8 @@ async def cmd_connect(
                "-o", "ServerAliveCountMax=3",
                "-o", "StrictHostKeyChecking=no",
                "-N"]
+    if ssh_key:
+        ssh_cmd += ["-i", ssh_key]
     for fwd in forwards:
         ssh_cmd += ["-L", fwd]
     ssh_cmd.append(f"{ssh_target}@127.0.0.1")
@@ -403,6 +407,8 @@ def main() -> None:
                          help="SSH user on the remote machine (e.g. radmin)")
     connect.add_argument("--forward", action="append", required=True,
                          help="SSH -L forward spec, e.g. 443:host:443 (repeatable)")
+    connect.add_argument("--ssh-key", default=None, dest="ssh_key",
+                         help="path to SSH private key (e.g. ~/.ssh/id_ed25519_redlab)")
     connect.add_argument("--token", default=None,
                          help="Dataloop JWT (uses stored login or prompts if omitted)")
 
@@ -417,7 +423,8 @@ def main() -> None:
         password = args.password or prompt_password()
         asyncio.run(cmd_connect(args.name, args.port, password,
                                 args.ssh_target, args.forward,
-                                token=args.token))
+                                token=args.token,
+                                ssh_key=args.ssh_key))
     elif args.role == "target":
         host, port = _parse_host_port(args.local)
         password = args.password or prompt_password()
